@@ -1,0 +1,98 @@
+name: Android 13 Emulator (Full UI, 6h max)
+
+on:
+  workflow_dispatch:   # manual trigger only, to avoid accidental long runs
+
+jobs:
+  emulator-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hours – the maximum for GitHub-hosted runners
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Start Android 13 Emulator with noVNC
+        run: |
+          docker run -d --name android-emulator \
+            --privileged \
+            -p 6080:6080 \
+            -p 5554:5554 \
+            -p 5555:5555 \
+            -e "EMULATOR_DEVICE=Samsung Galaxy S10" \
+            -e "WEB_VNC=true" \
+            -e "EMULATOR_DATA_PARTITION=4096m" \
+            budtmo/docker-android:emulator_13.0
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      # ---- This step prints the URL to the LIVE LOGS ----
+      - name: Start cloudflared quick tunnel (URL appears in this step's logs)
+        run: |
+          # Start tunnel in background, but log its output to a file we can tail
+          nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 &
+
+          echo "Waiting for cloudflared to publish a URL..."
+          for i in {1..30}; do
+            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
+            if [ -n "$URL" ]; then
+              echo "=========================================================="
+              echo "✅ noVNC URL: $URL/vnc.html?autoconnect=true&resize=scale"
+              echo "=========================================================="
+              echo "NOVNC_URL=$URL/vnc.html?autoconnect=true&resize=scale" >> "$GITHUB_ENV"
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "${NOVNC_URL:-}" ]; then
+            echo "Failed to obtain tunnel URL"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+      - name: Wait for emulator to boot
+        run: |
+          echo "Waiting for emulator to come online..."
+          timeout 300 bash -c '
+            until adb devices | grep -q "device$"; do sleep 5; done
+          '
+          timeout 180 bash -c '
+            until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 3; done
+          '
+          echo "Emulator UI is ready."
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Install APK
+        run: adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+      # ---- Keep the job alive for the full 6-hour window ----
+      - name: Keep session alive (6 hours)
+        run: |
+          echo "Session will remain live for up to 6 hours."
+          echo "URL (also printed above): $NOVNC_URL"
+          # Sleep for 6 hours (21600 seconds) – the runner will kill the job at the 6h mark anyway
+          sleep 21600
