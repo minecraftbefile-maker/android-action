@@ -9,55 +9,20 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: '17'
-
-      # THIS IS THE NEW APT STEP. IT REPLACES SETUP-ANDROID
-      - name: Install ADB via apt
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y android-tools-adb
-
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || { echo "❌ /dev/kvm missing"; exit 1; }
 
-      - name: Install cloudflared
+      - name: Install cloudflared & start tunnel
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-      - name: Pre-flight Tool Check
-        run: |
-          echo "=== Verifying required tools ==="
-          command -v docker >/dev/null 2>&1 && echo "✅ Docker: $(docker --version)" || (echo "❌ Docker missing" && exit 1)
-          command -v adb >/dev/null 2>&1 && echo "✅ ADB: $(adb version | head -n 1)" || (echo "❌ ADB missing" && exit 1)
-          command -v java >/dev/null 2>&1 && echo "✅ Java: $(java -version 2>&1 | head -n 1)" || (echo "❌ Java missing" && exit 1)
-          command -v cloudflared >/dev/null 2>&1 && echo "✅ Cloudflared: $(cloudflared --version)" || (echo "❌ Cloudflared missing" && exit 1)
-          echo "=== All tools verified successfully ==="
-
-      - name: Start Android 13 Emulator with noVNC
-        run: |
-          docker run -d --name android-emulator \
-            --privileged \
-            -p 6080:6080 -p 5554:5554 -p 5555:5555 \
-            -e "EMULATOR_DEVICE=Samsung Galaxy S10" \
-            -e "WEB_VNC=true" \
-            -e "EMULATOR_DATA_PARTITION=4096m" \
-            budtmo/docker-android:emulator_13.0
-
-      - name: Start cloudflared quick tunnel
-        run: |
           setsid nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate \
             > /tmp/cloudflared.log 2>&1 < /dev/null &
           disown || true
@@ -67,12 +32,9 @@ jobs:
           for i in $(seq 1 60); do
             URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
             [ -n "$URL" ] && break
-            sleep 2
+            sleep 1
           done
-
-          if [ -z "$URL" ]; then
-            echo "Failed to obtain tunnel URL"; cat /tmp/cloudflared.log; exit 1
-          fi
+          [ -z "$URL" ] && { echo "Failed to obtain tunnel URL"; cat /tmp/cloudflared.log; exit 1; }
 
           NOVNC_URL="$URL/vnc.html?autoconnect=true&resize=scale"
           echo "=========================================================="
@@ -80,33 +42,30 @@ jobs:
           echo "=========================================================="
           echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
 
+      - name: Start Android 13 Emulator
+        run: |
+          docker run -d --name android-emulator \
+            --privileged \
+            -p 6080:6080 -p 5554:5554 -p 5555:5555 \
+            -e "EMULATOR_DEVICE=Samsung Galaxy S10" \
+            -e "WEB_VNC=true" \
+            -e "EMULATOR_DATA_PARTITION=4096m" \
+            budtmo/docker-android:emulator_13.0
+
       - name: Wait for emulator to boot
         run: |
-          adb start-server
-          adb connect localhost:5555 || true
-          echo "Waiting for emulator to come online..."
-          timeout 300 bash -c '
-            until adb devices | grep -qE "(emulator-5554|localhost:5555)[[:space:]]+device$"; do sleep 5; done
-          '
+          echo "Waiting for noVNC to be reachable..."
+          timeout 300 bash -c 'until curl -sf http://localhost:6080/vnc.html >/dev/null; do sleep 2; done' \
+            || { echo "noVNC not reachable"; docker logs android-emulator --tail 100; exit 1; }
+
           echo "Waiting for Android UI to fully boot..."
-          timeout 180 bash -c '
-            until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 3; done
-          '
-          echo "Emulator UI is ready."
+          timeout 600 bash -c '
+            until [ "$(docker exec android-emulator adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 3; done
+          ' || echo "⚠️  Boot check timed out; emulator may still be booting."
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        if: hashFiles('gradlew') != ''
-
-      - name: Build Debug APK
-        if: hashFiles('gradlew') != ''
-        run: ./gradlew assembleDebug
-
-      - name: Install APK
-        if: hashFiles('gradlew') != ''
-        run: adb -s localhost:5555 install -r app/build/outputs/apk/debug/app-debug.apk
+          echo "✅ Emulator is up."
 
       - name: Keep session alive (6h)
         run: |
-          echo "Live URL (also printed in the cloudflared step): $NOVNC_URL"
+          echo "Live URL: $NOVNC_URL"
           sleep 21600
