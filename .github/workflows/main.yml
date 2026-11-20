@@ -1,12 +1,12 @@
 name: Android 13 Emulator (Full UI, 6h max)
 
 on:
-  workflow_dispatch:   # manual trigger only, to avoid accidental long runs
+  workflow_dispatch:
 
 jobs:
   emulator-ui:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours – the maximum for GitHub-hosted runners
+    timeout-minutes: 360   # 6 hours – GitHub-hosted runner max
 
     steps:
       - name: Checkout code
@@ -23,9 +23,7 @@ jobs:
         run: |
           docker run -d --name android-emulator \
             --privileged \
-            -p 6080:6080 \
-            -p 5554:5554 \
-            -p 5555:5555 \
+            -p 6080:6080 -p 5554:5554 -p 5555:5555 \
             -e "EMULATOR_DEVICE=Samsung Galaxy S10" \
             -e "WEB_VNC=true" \
             -e "EMULATOR_DATA_PARTITION=4096m" \
@@ -37,37 +35,37 @@ jobs:
             -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
 
-      # ---- This step prints the URL to the LIVE LOGS ----
-      - name: Start cloudflared quick tunnel (URL appears in this step's logs)
+      # ---- FIXED: set NOVNC_URL as a shell variable so the check works ----
+      - name: Start cloudflared quick tunnel
         run: |
-          # Start tunnel in background, but log its output to a file we can tail
-          nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate \
-            > /tmp/cloudflared.log 2>&1 &
+          setsid nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 < /dev/null &
+          disown || true
 
           echo "Waiting for cloudflared to publish a URL..."
-          for i in {1..30}; do
+          URL=""
+          for i in $(seq 1 60); do
             URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1 || true)
-            if [ -n "$URL" ]; then
-              echo "=========================================================="
-              echo "✅ noVNC URL: $URL/vnc.html?autoconnect=true&resize=scale"
-              echo "=========================================================="
-              echo "NOVNC_URL=$URL/vnc.html?autoconnect=true&resize=scale" >> "$GITHUB_ENV"
-              break
-            fi
+            [ -n "$URL" ] && break
             sleep 2
           done
 
-          if [ -z "${NOVNC_URL:-}" ]; then
-            echo "Failed to obtain tunnel URL"
-            cat /tmp/cloudflared.log
-            exit 1
+          if [ -z "$URL" ]; then
+            echo "Failed to obtain tunnel URL"; cat /tmp/cloudflared.log; exit 1
           fi
+
+          NOVNC_URL="$URL/vnc.html?autoconnect=true&resize=scale"
+          echo "=========================================================="
+          echo "✅ noVNC URL: $NOVNC_URL"
+          echo "=========================================================="
+          echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
 
       - name: Wait for emulator to boot
         run: |
-          echo "Waiting for emulator to come online..."
+          adb start-server
+          adb connect localhost:5555 || true
           timeout 300 bash -c '
-            until adb devices | grep -q "device$"; do sleep 5; done
+            until adb devices | grep -qE "(emulator-5554|localhost:5555)[[:space:]]+device$"; do sleep 5; done
           '
           timeout 180 bash -c '
             until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 3; done
@@ -87,12 +85,9 @@ jobs:
         run: ./gradlew assembleDebug
 
       - name: Install APK
-        run: adb install -r app/build/outputs/apk/debug/app-debug.apk
+        run: adb -s localhost:5555 install -r app/build/outputs/apk/debug/app-debug.apk
 
-      # ---- Keep the job alive for the full 6-hour window ----
-      - name: Keep session alive (6 hours)
+      - name: Keep session alive (6h)
         run: |
-          echo "Session will remain live for up to 6 hours."
-          echo "URL (also printed above): $NOVNC_URL"
-          # Sleep for 6 hours (21600 seconds) – the runner will kill the job at the 6h mark anyway
+          echo "Live URL (also printed in the previous step's log): $NOVNC_URL"
           sleep 21600
