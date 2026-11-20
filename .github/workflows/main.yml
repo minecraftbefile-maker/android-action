@@ -6,12 +6,24 @@ on:
 jobs:
   emulator-ui:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours – GitHub-hosted runner max
+    timeout-minutes: 360   # 6 hours max
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 1. Setup Java (needed for Gradle and emulator tools)
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      # 2. Setup Android SDK (THIS INSTALLS 'adb' AND 'sdkmanager')
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 3. Enable KVM hardware acceleration (critical for emulator speed)
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -19,6 +31,24 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # 4. Install cloudflared
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      # 5. PRE-FLIGHT CHECKS (Verify all tools before starting the heavy stuff)
+      - name: Pre-flight Tool Check
+        run: |
+          echo "=== Verifying required tools ==="
+          command -v docker >/dev/null 2>&1 && echo "✅ Docker: $(docker --version)" || (echo "❌ Docker missing" && exit 1)
+          command -v adb >/dev/null 2>&1 && echo "✅ ADB: $(adb version | head -n 1)" || (echo "❌ ADB missing" && exit 1)
+          command -v java >/dev/null 2>&1 && echo "✅ Java: $(java -version 2>&1 | head -n 1)" || (echo "❌ Java missing" && exit 1)
+          command -v cloudflared >/dev/null 2>&1 && echo "✅ Cloudflared: $(cloudflared --version)" || (echo "❌ Cloudflared missing" && exit 1)
+          echo "=== All tools verified successfully ==="
+
+      # 6. Start the emulator container
       - name: Start Android 13 Emulator with noVNC
         run: |
           docker run -d --name android-emulator \
@@ -29,13 +59,7 @@ jobs:
             -e "EMULATOR_DATA_PARTITION=4096m" \
             budtmo/docker-android:emulator_13.0
 
-      - name: Install cloudflared
-        run: |
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /usr/local/bin/cloudflared
-          chmod +x /usr/local/bin/cloudflared
-
-      # ---- FIXED: set NOVNC_URL as a shell variable so the check works ----
+      # 7. Start the tunnel and capture the URL
       - name: Start cloudflared quick tunnel
         run: |
           setsid nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate \
@@ -60,33 +84,35 @@ jobs:
           echo "=========================================================="
           echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
 
+      # 8. Wait for ADB to connect to the emulator
       - name: Wait for emulator to boot
         run: |
           adb start-server
           adb connect localhost:5555 || true
+          echo "Waiting for emulator to come online..."
           timeout 300 bash -c '
             until adb devices | grep -qE "(emulator-5554|localhost:5555)[[:space:]]+device$"; do sleep 5; done
           '
+          echo "Waiting for Android UI to fully boot..."
           timeout 180 bash -c '
             until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 3; done
           '
           echo "Emulator UI is ready."
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: '17'
-
+      # 9. Build the APK (Only runs if gradlew exists)
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        if: hashFiles('gradlew') != ''
 
       - name: Build Debug APK
+        if: hashFiles('gradlew') != ''
         run: ./gradlew assembleDebug
 
       - name: Install APK
+        if: hashFiles('gradlew') != ''
         run: adb -s localhost:5555 install -r app/build/outputs/apk/debug/app-debug.apk
 
+      # 10. Keep session alive
       - name: Keep session alive (6h)
         run: |
           echo "Live URL (also printed in the previous step's log): $NOVNC_URL"
