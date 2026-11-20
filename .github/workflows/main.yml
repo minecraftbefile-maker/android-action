@@ -1,4 +1,4 @@
-name: Android 13 Emulator (Full UI, 6h max)
+name: Android 11 Emulator (Full UI, 6h max)
 
 on:
   workflow_dispatch:
@@ -42,7 +42,7 @@ jobs:
           echo "=========================================================="
           echo "NOVNC_URL=$NOVNC_URL" >> "$GITHUB_ENV"
 
-      - name: Start Android 13 Emulator
+      - name: Start Android 11 Emulator (lightweight Alpine image)
         run: |
           docker run -d --name android-emulator \
             --privileged \
@@ -50,7 +50,7 @@ jobs:
             -e "EMULATOR_DEVICE=Samsung Galaxy S10" \
             -e "WEB_VNC=true" \
             -e "EMULATOR_DATA_PARTITION=4096m" \
-            budtmo/docker-android:emulator_13.0
+            budtmo/docker-android:emulator_11.0
 
       - name: Wait for emulator to boot
         run: |
